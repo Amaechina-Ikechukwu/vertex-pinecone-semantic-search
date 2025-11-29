@@ -1,10 +1,4 @@
-/**
- * 🔥 Firebase AI-Powered Image Indexing + Search with VertexAI + Pinecone
- * - describeAndStoreImage: triggered on upload, describes image, stores to Firestore + Pinecone
- * - searchImages: keyword-based search via Firestore
- * - semanticSearchImages: vector-based search via Pinecone + multimodal embedding
- */
-
+const { getStorage } = require("firebase-admin/storage");
 const { onObjectFinalized } = require("firebase-functions/v2/storage");
 const { onRequest } = require("firebase-functions/v2/https");
 const { initializeApp } = require("firebase-admin/app");
@@ -12,6 +6,7 @@ const { getFirestore } = require("firebase-admin/firestore");
 const { Pinecone } = require("@pinecone-database/pinecone");
 const path = require("path");
 const logger = require("firebase-functions/logger");
+const { GoogleAuth } = require("google-auth-library");
 
 // --- CONFIGURATION ---
 const GCP_LOCATION = "us-central1";
@@ -20,18 +15,26 @@ const FIRESTORE_COLLECTION = "imageDescriptions";
 const EMBEDDING_MODEL = "multimodalembedding@001";
 const EMULATOR_GCS_URI = "gs://policypal-4meu1.firebasestorage.app/spenser-sembrat-s7W2PXuYGcc-unsplash.jpg";
 const EMULATOR_MIME_TYPE = "image/jpeg";
+const IMAGE_GEN_MODEL = "gemini-2.5-flash-image";
+
 
 // --- FIREBASE INIT (Lazy) ---
 let adminApp;
-let db;
+let db, storage; // 'storage' is declared here
+
 function getDb() {
   if (!adminApp) {
     adminApp = initializeApp();
     db = getFirestore();
+    storage = getStorage(); // 👈 **ADD THIS LINE**
   }
   return db;
 }
-
+// 👇 THIS IS THE FUNCTION THAT WAS MISSING
+function getStorageBucket() {
+  if (!adminApp) getDb(); // This will now correctly initialize 'storage'
+  return storage.bucket(); 
+}
 // --- CORS ---
 function setCorsHeaders(req, res) {
   const origin = (req && req.get && req.get("origin")) || "*";
@@ -70,6 +73,7 @@ async function retryWithBackoff(fn, maxRetries = 5, initialDelay = 1000) {
 let VertexAI, aiplatform, PredictionServiceClient, helpers;
 let predictionServiceClient;
 
+// ...
 function getClients() {
   if (!VertexAI) {
     VertexAI = require("@google-cloud/vertexai").VertexAI;
@@ -79,8 +83,17 @@ function getClients() {
     location: GCP_LOCATION,
   });
   const visionModel = vertexAI.getGenerativeModel({ model: VISION_MODEL });
-  return { visionModel };
+
+  // 👇 **ADD THIS BACK**
+  const imageGenModel = vertexAI.getGenerativeModel({
+    model: IMAGE_GEN_MODEL,
+    // This config at initialization is CRITICAL
+    generationConfig: { "responseMimeType": "image/png" },
+  });
+
+  return { visionModel, imageGenModel }; // 👈 **RETURN BOTH MODELS**
 }
+
 
 function getPredictionServiceClient() {
   if (!aiplatform) {
@@ -303,6 +316,138 @@ exports.semanticSearchImages = onRequest(
     } catch (error) {
       logger.error("Semantic search error:", error);
       res.status(500).json({ error: "Semantic search failed" });
+    }
+  }
+);
+
+// ❗️ You must update these placeholders
+const REGION = "us-central1"; // Or your specific region
+const PROJECT_ID = "policypal-4meu1"; // Your Google Cloud Project ID
+const MODEL_ID = "imagen-4.0-ultra-generate-001"; // Or "gemini-1.5-pro-001", etc.
+
+// Construct the HTTPS endpoint URL
+const vertexApiUrl = `https://${REGION}-aiplatform.googleapis.com/v1/projects/${PROJECT_ID}/locations/${REGION}/publishers/google/models/${MODEL_ID}:generateContent`;
+
+// Initialize Google Auth client
+const auth = new GoogleAuth({
+  scopes: "https://www.googleapis.com/auth/cloud-platform",
+});
+
+// Mocking helper from your original code
+// const setCorsHeaders = (req, res) => { /* ... */ };
+
+exports.generateImage = onRequest(
+  {
+    timeoutSeconds: 120,
+    memory: "1GiB",
+  },
+  async (req, res) => {
+    // setCorsHeaders(req, res); // Assuming you have this helper
+    if (req.method === "OPTIONS") return res.status(204).send("");
+
+    try {
+      const { prompt, count = 1 } = req.body;
+      const numImages = parseInt(count, 10) || 1;
+
+      if (!prompt) {
+        return res.status(400).json({ error: "Missing 'prompt' in request body" });
+      }
+
+      logger.log(`Generating ${numImages} image(s) for prompt: "${prompt}"`);
+
+      // 1. Build the request body (matches the SDK's structure)
+      const requestBody = {
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: prompt }],
+          },
+        ],
+        generationConfig: {
+          responseMimeType: "image/png", // REQUIRED for image output
+          candidateCount: numImages,
+        },
+      };
+
+      // 2. Get an access token for the API call
+      const client = await auth.getClient();
+      const accessToken = (await client.getAccessToken()).token;
+
+      // 3. Call the Vertex AI HTTPS endpoint using fetch
+      // (Replaces the imageGenModel.generateContent() call)
+      const apiResponse = await fetch(vertexApiUrl, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${accessToken}`,
+          "Content-Type": "application/json; charset=utf-8",
+        },
+        body: JSON.stringify(requestBody),
+      });
+
+      if (!apiResponse.ok) {
+        const errorBody = await apiResponse.text();
+        throw new Error(`API request failed with status ${apiResponse.status}: ${errorBody}`);
+      }
+
+      // The API response body is the "result"
+      const result = await apiResponse.json();
+
+      // 4. Process the response (this logic is from your original code)
+      const response = result; // The top-level object is the response
+      if (!response?.candidates || response.candidates.length === 0) {
+        throw new Error("No image candidates were generated by the API.");
+      }
+
+      // Get the storage bucket (assuming admin is initialized)
+      const bucket = getStorage().bucket(); // Replaced getStorageBucket()
+      const savedImages = [];
+      const slug = prompt.toLowerCase().replace(/[^a-z0-9]/g, "-").slice(0, 30);
+      let index = 0;
+
+      for (const candidate of response.candidates) {
+        if (candidate.finishReason !== "SAFETY" && candidate.content?.parts?.[0]) {
+          const part = candidate.content.parts[0];
+
+          if (part.inlineData?.data) {
+            const imageBytesBase64 = part.inlineData.data;
+            const imageBuffer = Buffer.from(imageBytesBase64, "base64");
+
+            const fileName = `generated/${Date.now()}-${slug}-${index++}.png`;
+            const file = bucket.file(fileName);
+
+            await file.save(imageBuffer, {
+              metadata: {
+                contentType: "image/png",
+                metadata: { generatedFromPrompt: prompt },
+              },
+            });
+
+            const publicUrl = `https://firebasestorage.googleapis.com/v0/b/${bucket.name}/o/${encodeURIComponent(fileName)}?alt=media`;
+            savedImages.push(publicUrl);
+            logger.log(`✅ Image saved to: ${publicUrl}`);
+
+          } else if (part.text) {
+            logger.warn(`API returned text instead of image: ${part.text}`);
+            throw new Error(`Image generation failed. API responded with: "${part.text}"`);
+          }
+        } else {
+          logger.warn(`Image candidate blocked due to: ${candidate.finishReason}`);
+        }
+      }
+
+      if (savedImages.length === 0) {
+        throw new Error("No images were successfully generated. Check logs for safety warnings.");
+      }
+
+      res.status(200).json({
+        prompt,
+        count: savedImages.length,
+        imageUrls: savedImages,
+      });
+
+    } catch (error) {
+      logger.error("❌ Error generating image:", error);
+      res.status(500).json({ error: error.message || "Image generation failed." });
     }
   }
 );
